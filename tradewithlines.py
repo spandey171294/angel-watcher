@@ -13,6 +13,22 @@ On a SELL signal → recommends buying the ATM PE of that index.
 
 Includes nearest Support/Resistance and TP/SL levels in each alert.
 
+Option Chain Confirmation (via option_chain_analyzer.py)
+─────────────────────────────────────────────────────────
+Each scan cycle also fetches the live NSE option chain and checks:
+  • PCR bias            — Put/Call ratio direction
+  • OI trend            — CE/PE change OI balance
+  • ATM OI pattern      — Short covering / Long buildup / etc.
+  • Max Pain            — Gravitational pull on index
+  • IV spikes           — Unusual IV at near-ATM strikes
+  • IV skew             — CE vs PE implied vol difference
+
+The result is appended to every technical alert as a confirmation line.
+When --oc-alert is passed, a full standalone OC alert is also sent when
+the option chain has a HIGH/MEDIUM confidence signal of its own.
+When --oc-confirm-only is passed, technical signals that CONFLICT with
+the option chain are suppressed (not sent to Telegram).
+
 Usage
 ─────
 python tradewithlines.py \
@@ -22,7 +38,9 @@ python tradewithlines.py \
     --totp-secret  <TOTP_SECRET> \
     --underlyings  NIFTY,BANKNIFTY \
     --intervals    ONE_MINUTE,FIVE_MINUTE,FIFTEEN_MINUTE \
-    --polling-seconds 60
+    --polling-seconds 60 \
+    --oc-alert \
+    --oc-confirm-only
 
 Environment variables required for Telegram:
   TELEGRAM_BOT_TOKEN
@@ -45,6 +63,12 @@ from SmartApi import SmartConnect
 
 from indicators import generate_all_signals
 from telegram_notifier import send_telegram
+from option_chain_analyzer import (
+    analyze_option_chain,
+    format_oc_alert,
+    format_oc_confirmation_line,
+    get_oc_confirmation,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -112,6 +136,8 @@ class Config:
     expiry:                   Optional[str]
     sens:                     float = 2.0       # Supertrend factor
     skip_mkt_hours:           bool  = False
+    oc_alert:                 bool  = False     # send standalone OC alert when OC fires HIGH/MEDIUM signal
+    oc_confirm_only:          bool  = False     # suppress technical signals that CONFLICT with OC
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -255,6 +281,7 @@ def build_alert(
     support: Optional[float],
     resistance: Optional[float],
     tp_sl: Optional[dict],
+    oc_line: Optional[str] = None,    # one-line OC confirmation appended at bottom
 ) -> str:
     bull   = direction == "BUY"
     arrow  = "🟢📈" if bull else "🔴📉"
@@ -305,6 +332,10 @@ def build_alert(
     if opt_price:
         lines.append(f"   Option LTP : {_fmt(opt_price)}")
 
+    # ── Option chain confirmation line (if available) ────────────────
+    if oc_line:
+        lines += ["", f"{'─'*35}", oc_line]
+
     lines.append(f"{'═'*35}")
     return "\n".join(lines)
 
@@ -325,6 +356,17 @@ def is_market_open() -> bool:
         return open_t <= now <= close_t
     except ImportError:
         return True   # pytz not installed — assume open
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# OPTION CHAIN CACHE  — re-use OC result across all intervals per cycle
+# ═══════════════════════════════════════════════════════════════════════
+
+# key = underlying  →  OC result dict from last successful fetch
+OC_CACHE: dict[str, dict] = {}
+
+# key = underlying  →  last bar_time when standalone OC alert was sent
+OC_ALERT_SENT: dict[str, str] = {}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -358,12 +400,39 @@ def run_once(
             )
         expiry = expiry_cache[underlying]
 
+        # ── Option chain analysis (once per underlying per cycle) ────
+        oc = None
+        try:
+            oc = analyze_option_chain(underlying)
+            OC_CACHE[underlying] = oc
+            oc_summary = (
+                f"OC→ {oc['signal']:<8} conf={oc['confidence']:<6} "
+                f"PCR={oc['pcr']:<5} MaxPain={oc['max_pain']:.0f} "
+                f"OI={oc['oi_trend']}"
+            )
+            iv_warn = "  ⚠ IV SPIKE" if oc.get("iv_spike_detected") else ""
+            print(f"  📊 {oc_summary}{iv_warn}")
+        except Exception as exc:
+            # Non-fatal: fall back to last cached result if available
+            oc = OC_CACHE.get(underlying)
+            print(f"  ⚠  OC fetch failed ({exc})"
+                  + ("  — using cached" if oc else "  — no cache"))
+
+        # If OC has its own standalone signal (HIGH/MEDIUM confidence)
+        # and --oc-alert was passed, send a dedicated OC alert once per signal.
+        if cfg.oc_alert and oc and oc.get("signal") not in ("NO SIGNAL", None):
+            oc_key = f"{underlying}|OC|{oc['signal']}|{oc.get('oi_trend')}"
+            if OC_ALERT_SENT.get(underlying) != oc_key:
+                OC_ALERT_SENT[underlying] = oc_key
+                send_telegram(format_oc_alert(oc))
+                print(f"  📤  OC STANDALONE ALERT → {oc['signal']} ({oc['confidence']})")
+
         print(f"\n{'═'*72}")
         print(f"  {underlying:<12}  SPOT {spot:>10,.2f}  |  ATM {atm}  |  EXPIRY {expiry}")
         print(f"{'═'*72}")
         print(f"  {'Timeframe':<18}  {'Price':<10}  {'ST':<6}  {'DM':<6}  {'QQE':<6}  "
-              f"{'Support':<10}  {'Resist':<10}")
-        print(f"  {'─'*68}")
+              f"{'Support':<10}  {'Resist':<10}  {'OC':<10}")
+        print(f"  {'─'*78}")
 
         for interval in cfg.intervals:
             days = INTERVAL_DAYS.get(interval, 10)
@@ -391,10 +460,11 @@ def run_once(
             res   = result["resistance"]
             bt    = result["bar_time"]
 
+            oc_bias_str = oc.get("bias", "—") if oc else "—"
             print(
                 f"  {interval:<18}  {price:<10,.2f}  "
                 f"{result['st_signal']:<6}  {result['diamond_signal']:<6}  {result['qqe_signal']:<6}  "
-                f"{_fmt(sup):<10}  {_fmt(res):<10}"
+                f"{_fmt(sup):<10}  {_fmt(res):<10}  {oc_bias_str:<10}"
             )
 
             # ─── check all three signal types ───────────────────────────
@@ -414,6 +484,21 @@ def run_once(
                     continue
 
                 LAST_SIGNALS[cache_key] = (sig_val, bt)
+
+                # ── OC confirmation check ────────────────────────────
+                oc_status = "NEUTRAL"
+                oc_line   = None
+                if oc:
+                    oc_status = get_oc_confirmation(oc, sig_val)
+                    oc_line   = format_oc_confirmation_line(oc, sig_val)
+
+                    if cfg.oc_confirm_only and oc_status == "CONFLICT":
+                        print(
+                            f"    ⛔  SUPPRESSED ({sig_name} {sig_val}) — "
+                            f"OC CONFLICT (bias={oc.get('bias')}, "
+                            f"avoid={oc.get('avoid_reasons', [])})"
+                        )
+                        continue   # skip this signal — OC disagrees
 
                 # Fetch option details
                 opt_type              = "CE" if sig_val == "BUY" else "PE"
@@ -435,12 +520,14 @@ def run_once(
                     support=sup,
                     resistance=res,
                     tp_sl=result.get("tp_sl"),
+                    oc_line=oc_line,
                 )
 
                 send_telegram(msg)
+                conf_tag = f"OC:{oc_status}" if oc else "OC:N/A"
                 print(
                     f"    🚨  ALERT SENT → {sig_name} {sig_val}  "
-                    f"{underlying}{atm}{opt_type}  OPT LTP={opt_price}"
+                    f"{underlying}{atm}{opt_type}  OPT LTP={opt_price}  [{conf_tag}]"
                 )
 
 
@@ -503,6 +590,24 @@ def main() -> None:
         action="store_true",
         help="Run even outside 09:15–15:30 IST. Useful for back-testing/testing.",
     )
+    parser.add_argument(
+        "--oc-alert",
+        action="store_true",
+        help=(
+            "Send a standalone Option Chain alert to Telegram when the OC\n"
+            "analysis has a HIGH or MEDIUM confidence signal of its own.\n"
+            "These are independent of the technical (Supertrend/Diamond/QQE) alerts."
+        ),
+    )
+    parser.add_argument(
+        "--oc-confirm-only",
+        action="store_true",
+        help=(
+            "Suppress any technical signal that CONFLICTS with the option chain bias.\n"
+            "Example: if OC says BEARISH but Supertrend fires BUY, the BUY is skipped.\n"
+            "Reduces noise at the cost of some true signals. Recommended with --oc-alert."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -528,8 +633,16 @@ def main() -> None:
         expiry=args.expiry,
         sens=args.sens,
         skip_mkt_hours=args.skip_market_hours_check,
+        oc_alert=args.oc_alert,
+        oc_confirm_only=args.oc_confirm_only,
     )
 
+    oc_mode = (
+        "confirm+alert" if (cfg.oc_confirm_only and cfg.oc_alert) else
+        "confirm-only"  if cfg.oc_confirm_only else
+        "alert-only"    if cfg.oc_alert        else
+        "passive (append only)"
+    )
     print("╔" + "═" * 58 + "╗")
     print("║       TradeswithLines — Angel One Index Scanner          ║")
     print("╠" + "═" * 58 + "╣")
@@ -539,6 +652,7 @@ def main() -> None:
         print(f"║               : {', '.join(cfg.intervals[3:]):<40} ║")
     print(f"║  Polling      : every {cfg.polling_seconds}s{'':<33} ║")
     print(f"║  Sensitivity  : {cfg.sens:<41} ║")
+    print(f"║  OC Mode      : {oc_mode:<40} ║")
     print("╚" + "═" * 58 + "╝")
 
     print("\nLogging in to Angel One…")
